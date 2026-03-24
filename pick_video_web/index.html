@@ -1,0 +1,60 @@
+
+<!DOCTYPE html>
+<html lang="en-us">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <title>Unity WebGL Player | Annotations_Generator</title>
+    <style>
+      /* 🔥 FIX 1: Reset the page to have no borders or scrollbars */
+      html, body { 
+          width: 100%;
+          height: 100%;
+          margin: 0; 
+          padding: 0; 
+          overflow: hidden; 
+          background-color: #000000; /* Black background looks cleaner than white/yellow */
+      }
+      /* 🔥 FIX 2: Force the canvas to fill the parent container completely */
+      #unity-canvas { 
+          width: 100%; 
+          height: 100%; 
+          position: absolute; 
+          top: 0; 
+          left: 0; 
+          display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="unity-canvas" tabindex="-1"></canvas>
+    
+    <script src="Build/pick_video_web.loader.js"></script>
+    <script>
+      // Detect High DPI (Retina) screens for sharp text
+      var dpr = window.devicePixelRatio || 1;
+
+      createUnityInstance(document.querySelector("#unity-canvas"), {
+        dataUrl: "Build/pick_video_web.data.unityweb",
+        frameworkUrl: "Build/pick_video_web.framework.js.unityweb",
+        codeUrl: "Build/pick_video_web.wasm.unityweb",
+        streamingAssetsUrl: "StreamingAssets",
+        companyName: "DefaultCompany",
+        productName: "Annotations_Generator",
+        productVersion: "0.1",
+        
+        // 🔥 FIX 4: Use High DPI for sharp text on laptops/monitors
+        devicePixelRatio: dpr, 
+      }).then((unityInstance) => {
+        // Optional: Any code to run after game loads
+      }).catch((message) => {
+        alert(message);
+      });
+    </script>
+  </body>
+</html>
+de low DPI rendering on high DPI displays.
+      });
+    </script>
+  </body>
+</html>

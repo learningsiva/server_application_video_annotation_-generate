@@ -1,0 +1,1 @@
+server side video generation web application.after build webgl, usually host/place in video-annotation-app repository. that url link is given to lingeswran
