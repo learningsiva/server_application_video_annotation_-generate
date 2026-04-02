@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en-us">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <title>Unity WebGL Player | Annotations_Generator</title>
+    <style>
+      html, body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background-color: #000000;
+      }
+      #unity-canvas {
+        width: 100%;
+        height: 100%;
+        position: absolute;
+        top: 0;
+        left: 0;
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="unity-canvas" tabindex="-1"></canvas>
+
+    <script src="Build/pick_video_web.loader.js"></script>
+    <script>
+      // ------------------------------------------------------------------
+      // WEBGL FIX 4 (HTML SIDE):
+      //
+      // ROOT CAUSE: Chrome on HiDPI screens (devicePixelRatio >= 2) fires
+      // TWO browser pointer events for a single physical tap:
+      //   1. pointerdown / touchstart  →  Unity receives event #1
+      //   2. click (synthetic)         →  Unity receives event #2
+      // Both arrive within ~50ms and both call OnVideoTapped() in Unity.
+      // Event #1 starts Play(). Event #2 sees _intendedPlaying=true and
+      // triggers annotation — video plays ~1 second then immediately stops.
+      //
+      // FIX: Intercept and deduplicate pointer events at the JS layer
+      // BEFORE they reach Unity, using a 350ms suppression window.
+      // This is the most reliable fix because it stops the duplicate event
+      // from ever reaching Unity's input system at all.
+      // ------------------------------------------------------------------
+
+      var canvas = document.querySelector("#unity-canvas");
+
+      // Track the last time we let a pointer event through to Unity
+      var lastPointerTime = 0;
+      var POINTER_DEDUPE_MS = 350; // suppress duplicates within 350ms
+
+      // We only deduplicate 'click' events — pointerdown/touchstart pass freely.
+      // This is because Unity uses 'click' for PointerClick EventTrigger events.
+      canvas.addEventListener('click', function(e) {
+        var now = Date.now();
+        if (now - lastPointerTime < POINTER_DEDUPE_MS) {
+          // This is a duplicate synthetic click — stop it reaching Unity
+          e.stopImmediatePropagation();
+          e.preventDefault();
+          return;
+        }
+        lastPointerTime = now;
+        // Allow through to Unity normally
+      }, true); // useCapture=true to intercept before Unity sees it
+
+      // On touch devices, touchstart is the first event — record it so
+      // the synthetic click that follows ~300ms later gets suppressed.
+      canvas.addEventListener('touchstart', function(e) {
+        lastPointerTime = Date.now();
+      }, { passive: true, capture: true });
+
+      // ------------------------------------------------------------------
+      // WEBGL FIX (HTML SIDE): devicePixelRatio — use 1 instead of dpr.
+      //
+      // Using devicePixelRatio: dpr (e.g. 2 on Retina) makes Unity think
+      // the canvas is physically larger than it is in CSS pixels. This
+      // causes Unity's input coordinate system to be scaled differently
+      // from the CSS layout, leading to:
+      //   - Misaligned tap positions (bounding box spawns in wrong place)
+      //   - Duplicate/misfired events due to coordinate translation
+      //
+      // For this app, sharp text is less important than correct input.
+      // Set devicePixelRatio: 1 for reliable input at all screen densities.
+      // If you need sharp text, test with dpr=2 and ensure your server-side
+      // coordinate handling accounts for the DPR scaling.
+      // ------------------------------------------------------------------
+
+      createUnityInstance(canvas, {
+        dataUrl:            "Build/pick_video_web.data.unityweb",
+        frameworkUrl:       "Build/pick_video_web.framework.js.unityweb",
+        codeUrl:            "Build/pick_video_web.wasm.unityweb",
+        streamingAssetsUrl: "StreamingAssets",
+        companyName:        "DefaultCompany",
+        productName:        "Annotations_Generator",
+        productVersion:     "0.1",
+
+        // FIX: Force devicePixelRatio to 1 — prevents coordinate mismatch
+        // and duplicate events on HiDPI screens (Retina, 4K monitors, etc.)
+        devicePixelRatio: 1,
+
+      }).then((unityInstance) => {
+        // Unity loaded successfully
+      }).catch((message) => {
+        alert(message);
+      });
+    </script>
+  </body>
+</html>
