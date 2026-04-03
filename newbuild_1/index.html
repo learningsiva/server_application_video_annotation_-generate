@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en-us">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <title>Unity WebGL Player | Annotations_Generator</title>
+    <style>
+      html, body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background-color: #000000;
+      }
+      #unity-canvas {
+        width: 100%;
+        height: 100%;
+        position: absolute;
+        top: 0;
+        left: 0;
+        display: block;
+      }
+    </style>
+
+    <!--
+    ============================================================
+    SPEED FLASH FIX
+    MUST be in <head> so it runs before Unity creates any <video>.
+
+    Root cause:
+      Chrome resets video.playbackRate to 1.0 internally every
+      time video.play() is called, AFTER the call stack that
+      invoked play() finishes. Unity's C# coroutine only applies
+      the 0.75x speed 1+ frames later — by then Chrome has
+      already painted frames at full speed. That is the flash.
+
+    Why the previous fix (setTimeout + play event) failed:
+      setTimeout(0) is a macrotask. The browser paint step runs
+      BEFORE macrotasks. So Chrome renders at least one full-speed
+      frame before setTimeout fires.
+
+    This fix — prototype patch + microtask:
+      We replace HTMLVideoElement.prototype.play with our own
+      wrapper BEFORE Unity loads. Our wrapper calls the real
+      play(), which returns a Promise. We chain a .then() on that
+      Promise. Promise callbacks are microtasks — they run AFTER
+      the current call stack AND BEFORE the browser paint step.
+      Chrome has completed its internal reset by the time the
+      Promise resolves, so setting 0.75x here is both correct
+      and happens before the first visible frame. Zero flash.
+    ============================================================
+    -->
+    <script>
+      (function () {
+        var TARGET_RATE = 0.75;
+
+        // ── Layer 1: Patch HTMLVideoElement.prototype.play ────────────────
+        var _nativePlay = HTMLVideoElement.prototype.play;
+
+        HTMLVideoElement.prototype.play = function () {
+          var self   = this;
+          var result = _nativePlay.call(this);
+
+          if (result && typeof result.then === 'function') {
+            result
+              .then(function () {
+                // Microtask: fires before next browser paint.
+                // Chrome's internal reset is done by now, safe to set.
+                self.playbackRate = TARGET_RATE;
+              })
+              .catch(function () {
+                // play() rejects if the element is detached mid-call.
+                // Nothing to do.
+              });
+          }
+
+          return result;
+        };
+
+        // ── Layer 2: ratechange safety net ────────────────────────────────
+        // Catches resets that happen outside play() — e.g. after a seek,
+        // after a stall recovery, or from any internal Chrome policy.
+        // _busy prevents set → ratechange → set infinite loop.
+        var _busy = false;
+        document.addEventListener('ratechange', function (e) {
+          if (e.target.tagName !== 'VIDEO') return;
+          if (_busy)                         return;
+          if (e.target.paused)               return;
+          if (e.target.playbackRate === TARGET_RATE) return;
+
+          _busy = true;
+          e.target.playbackRate = TARGET_RATE;
+          _busy = false;
+        }, true);
+
+      })();
+    </script>
+  </head>
+
+  <body>
+    <canvas id="unity-canvas" tabindex="-1"></canvas>
+
+    <script src="Build_v1.1/newbuild_1.loader.js"></script>
+    <script>
+      var dpr = window.devicePixelRatio || 1;
+
+      createUnityInstance(document.querySelector("#unity-canvas"), {
+        dataUrl: "Build_v1.1/newbuild_1.data.unityweb",
+        frameworkUrl: "Build_v1.1/newbuild_1.framework.js.unityweb",
+        codeUrl: "Build_v1.1/newbuild_1.wasm.unityweb",
+        streamingAssetsUrl: "StreamingAssets",
+        companyName:        "DefaultCompany",
+        productName:        "Annotations_Generator",
+        productVersion:     "0.1",
+        devicePixelRatio:   dpr,
+      }).then(function (unityInstance) {
+        // Unity ready — speed fix already active from <head>.
+      }).catch(function (message) {
+        alert(message);
+      });
+    </script>
+  </body>
+</html>

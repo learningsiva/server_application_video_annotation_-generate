@@ -53,7 +53,7 @@ public class VideoAnnotationManager : MonoBehaviour
     public RawImage videoDisplay;
     public Button playButton;
     public Button pauseButton;
-    public Button overlayPlayButton; // Visual only — no click handling
+    public Button overlayPlayButton;
     public TMP_Text outputText;
 
     [Header("Floating UI Prefabs")]
@@ -94,42 +94,35 @@ public class VideoAnnotationManager : MonoBehaviour
     public bool saveToDatabase = true;
 
     // =====================================================================
-    // FIX 1 — SPEED RACER
-    // Chrome resets video.playbackRate to 1.0 every time Play() is called.
-    // We do NOT set speed before or during Play().
-    // We wait 5 frames AFTER Play() then set it — by that time Chrome has
-    // finished its internal reset and our value sticks.
+    // SPEED FLASH FIX
+    // After every Play(), call ApplySpeed() immediately.
+    // In WebGL: jslib SetVideoPlaybackRate() runs synchronously in the same
+    //           JS call stack — before Chrome paints any frame. Zero flash.
+    // In Editor: 1-frame coroutine fallback (Chrome reset doesn't apply).
+    // The index.html prototype patch is the third safety net.
     // =====================================================================
     private const float PLAYBACK_SPEED = 0.75f;
 
-    // =====================================================================
-    // FIX 2 — UI GHOST
-    // Chrome takes several frames to confirm isPlaying=true after Play().
-    // We track our OWN intended play state that flips instantly on the same
-    // frame as the user action — never waiting for Chrome's reply.
-    // =====================================================================
-    private bool _intendedPlaying = false;
+#if UNITY_WEBGL && !UNITY_EDITOR
+    [System.Runtime.InteropServices.DllImport("__Internal")]
+    private static extern void SetVideoPlaybackRate(float rate);
+#endif
 
-    // =====================================================================
-    // FIX 4 — PHANTOM TAP
-    // Chrome sends a synthetic second click ~50ms after every real tap.
-    // Unity sees Click#1 → starts video. Click#2 → wrongly triggers annotation.
-    //
-    // We use a STATE MACHINE. Each state has exactly ONE allowed action.
-    // Even if 10 duplicate events arrive, they all see the same state and
-    // do the same (correct) thing — or are explicitly blocked (Annotating).
-    //
-    // WaitingFirstTap → tap → starts video → Playing
-    // Playing         → tap → pauses + screenshot → Annotating
-    // Annotating      → tap → BLOCKED (waiting for server response)
-    // Paused          → tap → resumes video → Playing
-    //
-    // Additionally: minimum 0.5s gap between any two accepted taps.
-    // =====================================================================
-    private enum VideoState { WaitingFirstTap, Playing, Annotating, Paused }
-    private VideoState _state = VideoState.WaitingFirstTap;
-    private float _lastTapTime = -999f;
-    private const float MIN_TAP_INTERVAL = 0.5f;
+    private void ApplySpeed()
+    {
+#if UNITY_WEBGL && !UNITY_EDITOR
+        SetVideoPlaybackRate(PLAYBACK_SPEED);
+#else
+        StartCoroutine(ApplySpeedEditorFallback());
+#endif
+    }
+
+    private IEnumerator ApplySpeedEditorFallback()
+    {
+        yield return null;
+        if (videoPlayer.isPrepared)
+            videoPlayer.playbackSpeed = PLAYBACK_SPEED;
+    }
 
     // API ENDPOINTS
     private string apiLoadUrl = "https://botclub.conbig.com/api/v1/get_annotation_progress";
@@ -149,6 +142,14 @@ public class VideoAnnotationManager : MonoBehaviour
     private bool wasPlayingBeforePause = false;
     private bool isUserDraggingSlider = false;
     private bool isLoadingState = false;
+
+    // =====================================================================
+    // FRAME PREVIEW STATE
+    // Used by the frameReady path so we know which frame we asked for
+    // and can update slider + text the moment the texture is ready.
+    // =====================================================================
+    private bool _waitingForFrame = false;
+    private float _pendingFrameTime = 0f;
 
     // DATA
     private long currentTaskId = -1;
@@ -190,44 +191,25 @@ public class VideoAnnotationManager : MonoBehaviour
     {
         videoDisplayRect = videoDisplay.GetComponent<RectTransform>();
 
-        // -----------------------------------------------------------------
-        // FIX 5 — GIANT HITBOX
-        // The overlayPlayButton was a large transparent button covering the
-        // entire screen. Any click anywhere triggered OnPlayClicked().
-        // Fix: Disable raycastTarget on EVERY graphic inside it so it is
-        // purely visual and catches zero clicks. Clicks fall through to the
-        // videoDisplay RawImage directly beneath it.
-        // Also: we do NOT wire overlayPlayButton.onClick to anything.
-        // -----------------------------------------------------------------
-        if (overlayPlayButton != null)
-        {
-            foreach (var graphic in overlayPlayButton.GetComponentsInChildren<Graphic>(true))
-                graphic.raycastTarget = false;
-        }
-
-        // -----------------------------------------------------------------
-        // FIX 4 — PHANTOM TAP (C# side)
-        // Use PointerDown NOT PointerClick.
-        // PointerClick fires for BOTH the real press AND Chrome's synthetic
-        // follow-up click. PointerDown fires exactly once per physical press.
-        // -----------------------------------------------------------------
+        // TAP TRIGGER — PointerClick is fine for annotation; phantom-tap
+        // is handled by the isProcessing / isPlaying guard below.
         videoDisplay.raycastTarget = true;
         EventTrigger videoTrigger = videoDisplay.gameObject.GetComponent<EventTrigger>();
         if (videoTrigger == null) videoTrigger = videoDisplay.gameObject.AddComponent<EventTrigger>();
         videoTrigger.triggers.Clear();
+        EventTrigger.Entry clickEntry = new EventTrigger.Entry { eventID = EventTriggerType.PointerClick };
+        clickEntry.callback.AddListener((data) => { OnVideoTapped((PointerEventData)data); });
+        videoTrigger.triggers.Add(clickEntry);
 
-        EventTrigger.Entry tapEntry = new EventTrigger.Entry { eventID = EventTriggerType.PointerDown };
-        tapEntry.callback.AddListener((data) => { OnVideoTapped((PointerEventData)data); });
-        videoTrigger.triggers.Add(tapEntry);
-
-        // Control buttons (play/pause in the UI bar — NOT the overlay)
+        // BUTTONS
         if (playButton) playButton.onClick.AddListener(OnPlayClicked);
         if (pauseButton) pauseButton.onClick.AddListener(OnPauseClicked);
+        if (overlayPlayButton) overlayPlayButton.onClick.AddListener(OnPlayClicked);
         if (forwardButton) forwardButton.onClick.AddListener(() => { if (videoPlayer.isPrepared) videoPlayer.time += 2.0f; });
         if (backwardButton) backwardButton.onClick.AddListener(() => { if (videoPlayer.isPrepared) videoPlayer.time -= 2.0f; });
         if (saveAndFinishButton) saveAndFinishButton.onClick.AddListener(OnSaveAndFinishClicked);
 
-        // Seek slider
+        // SLIDER
         if (seekSlider != null)
         {
             EventTrigger sliderTrigger = seekSlider.gameObject.GetComponent<EventTrigger>();
@@ -238,19 +220,17 @@ public class VideoAnnotationManager : MonoBehaviour
             sliderTrigger.triggers.Add(downEntry);
 
             EventTrigger.Entry upEntry = new EventTrigger.Entry { eventID = EventTriggerType.PointerUp };
-            upEntry.callback.AddListener((data) =>
-            {
+            upEntry.callback.AddListener((data) => {
                 isUserDraggingSlider = false;
                 if (videoPlayer.isPrepared)
                 {
                     videoPlayer.time = seekSlider.value;
-                    StartCoroutine(ApplySpeedAfterDelay()); // FIX 1
+                    ApplySpeed(); // re-apply after seek
                 }
             });
             sliderTrigger.triggers.Add(upEntry);
 
-            seekSlider.onValueChanged.AddListener((val) =>
-            {
+            seekSlider.onValueChanged.AddListener((val) => {
                 if (isUserDraggingSlider && videoPlayer.isPrepared)
                 {
                     videoPlayer.time = val;
@@ -259,17 +239,24 @@ public class VideoAnnotationManager : MonoBehaviour
             });
         }
 
-        // FIX 3 — MEMORY WALL: errorReceived catches Chrome killing the
-        // video process when WebGL memory is exceeded (high DPR + 4K video).
+        // VIDEO PLAYER EVENTS
+        videoPlayer.prepareCompleted += OnVideoPrepareCompleted;
         videoPlayer.loopPointReached += OnVideoReachedEnd;
         videoPlayer.errorReceived += OnVideoError;
-        videoPlayer.prepareCompleted += OnVideoPrepareCompleted;
+
+        // =====================================================================
+        // FRAME PREVIEW SETUP
+        // sendFrameReadyEvents lets us request a single frame decode without
+        // calling Play(). We enable it here so the callback is always wired.
+        // We only ACT on the callback when _waitingForFrame is true.
+        // =====================================================================
+        videoPlayer.sendFrameReadyEvents = true;
+        videoPlayer.frameReady += OnFrameReady;
 
         if (finalPanel) finalPanel.SetActive(true);
         if (stagedCountText) stagedCountText.text = "0 annotations";
 
-        _state = VideoState.WaitingFirstTap;
-        SyncPlayPauseButtons();
+        SetPlayPauseUI(isPlaying: false);
         UpdateOutput("Waiting for Task Data...");
 
 #if UNITY_EDITOR
@@ -280,42 +267,95 @@ public class VideoAnnotationManager : MonoBehaviour
     // ==================================================================
     void Update()
     {
-        if (videoPlayer.isPrepared)
+        if (videoPlayer.isPrepared && videoPlayer.isPlaying)
         {
-            if (!isUserDraggingSlider && !isLoadingState && seekSlider)
+            if (!isUserDraggingSlider && seekSlider)
                 seekSlider.value = (float)videoPlayer.time;
 
             if (currentFrameText) currentFrameText.text = FormatTime(videoPlayer.time);
         }
-        SyncPlayPauseButtons();
+
+        if (overlayPlayButton)
+            overlayPlayButton.gameObject.SetActive(!videoPlayer.isPlaying && !isProcessing);
     }
 
-    // -----------------------------------------------------------------
-    // FIX 2 — UI GHOST
-    // Buttons are driven by _intendedPlaying (our own flag) — not by
-    // videoPlayer.isPlaying which Chrome takes several frames to update.
-    // Our flag flips on the exact frame the user clicks — always correct.
-    // -----------------------------------------------------------------
-    private void SyncPlayPauseButtons()
+    // ==================================================================
+    // FRAME READY CALLBACK
+    // Fires when the video decoder has pushed a new frame into the texture.
+    // We use this to display the first/resume frame immediately on load,
+    // without calling Play() — which would be blocked by Chrome's autoplay
+    // policy before the user has tapped anything.
+    // ==================================================================
+    private void OnFrameReady(VideoPlayer vp, long frameIndex)
     {
-        if (playButton) playButton.gameObject.SetActive(!_intendedPlaying);
-        if (pauseButton) pauseButton.gameObject.SetActive(_intendedPlaying);
-        // overlayPlayButton: visible when paused, purely visual (no raycast)
-        if (overlayPlayButton) overlayPlayButton.gameObject.SetActive(!_intendedPlaying && !isProcessing);
+        // Always keep the display texture in sync
+        if (videoDisplay.texture == null)
+            videoDisplay.texture = vp.texture;
+
+        if (!_waitingForFrame) return;
+        _waitingForFrame = false;
+
+        // Frame is now in the texture — update all UI immediately
+        videoDisplay.texture = vp.texture;
+
+        if (seekSlider)
+        {
+            seekSlider.value = _pendingFrameTime;
+        }
+        if (currentFrameText)
+        {
+            currentFrameText.text = FormatTime(_pendingFrameTime);
+        }
+
+        SetPlayPauseUI(isPlaying: false);
+        isLoadingState = false;
+
+        string msg = _pendingFrameTime > 0f ? "[Resumed] — tap to play." : "Ready — tap to play.";
+        UpdateOutput(msg);
     }
 
-    // -----------------------------------------------------------------
-    // FIX 1 — SPEED RACER
-    // Wait 5 frames after Play() before setting speed. By then Chrome has
-    // finished its internal reset and our 0.75x value will stick.
-    // -----------------------------------------------------------------
-    private IEnumerator ApplySpeedAfterDelay()
+    // ==================================================================
+    // SHOW FRAME WITHOUT PLAYING
+    // Seeks to 'time' and requests one frame decode.
+    // Works in WebGL before any user gesture because we never call Play().
+    // Also updates total-length text and slider range immediately.
+    // ==================================================================
+    private void ShowFrameAt(float time)
     {
-        for (int i = 0; i < 5; i++) yield return null;
-        if (videoPlayer.isPrepared)
-            videoPlayer.playbackSpeed = PLAYBACK_SPEED;
+        _pendingFrameTime = time;
+        _waitingForFrame = true;
+
+        videoPlayer.time = time;
+
+        // Requesting a frame decode: in WebGL, setting .time on a prepared
+        // VideoPlayer with sendFrameReadyEvents=true triggers the decoder
+        // to output that frame into the texture and fire frameReady.
+        // No Play() call needed — Chrome autoplay policy is not triggered.
+#if !UNITY_WEBGL || UNITY_EDITOR
+        // In Editor the decoder needs a nudge — Play+Pause for 1 frame.
+        StartCoroutine(EditorFrameNudge(time));
+#endif
     }
 
+#if !UNITY_WEBGL || UNITY_EDITOR
+    private IEnumerator EditorFrameNudge(float time)
+    {
+        videoPlayer.playbackSpeed = PLAYBACK_SPEED;
+        videoPlayer.Play();
+        yield return null;
+        yield return null;
+        videoPlayer.Pause();
+        // OnFrameReady will fire and handle the rest
+    }
+#endif
+
+    // ==================================================================
+    // SET TASK DATA
+    // In the Unity Editor on Windows, WMF (the video backend) cannot follow
+    // HTTP 302 redirects. Rails Active Storage /redirect/ URLs always return
+    // a 302 to the real file on S3/GCS. WMF aborts with 0x80004004.
+    // Fix: in Editor, resolve the redirect first with a HEAD request and give
+    // WMF the final direct URL. WebGL/Chrome handles redirects natively.
     // ==================================================================
     public void SetTaskData(int taskId, string url, string topic, string desc, string cls, string subj)
     {
@@ -328,22 +368,64 @@ public class VideoAnnotationManager : MonoBehaviour
         if (!string.IsNullOrEmpty(url))
         {
             UpdateOutput("Loading Video...");
+#if UNITY_EDITOR
+            // Resolve any redirect before handing the URL to WMF
+            StartCoroutine(ResolveAndLoad(url));
+#else
             videoPlayer.url = url;
             videoPlayer.Prepare();
+#endif
         }
     }
 
+#if UNITY_EDITOR
+    // Follows redirects by issuing a HEAD request. UnityWebRequest follows
+    // 302s internally and exposes the final landed URL via .url.
+    // WMF gets the resolved direct URL — no more 0x80004004 E_ABORT.
+    private IEnumerator ResolveAndLoad(string originalUrl)
+    {
+        UpdateOutput("Resolving video URL...");
+        using (UnityWebRequest head = UnityWebRequest.Head(originalUrl))
+        {
+            head.timeout = 10;
+            yield return head.SendWebRequest();
+
+            string finalUrl = originalUrl; // fallback
+            if ((head.result == UnityWebRequest.Result.Success ||
+                 head.result == UnityWebRequest.Result.ProtocolError) &&
+                !string.IsNullOrEmpty(head.url))
+            {
+                finalUrl = head.url;
+            }
+            else
+            {
+                Debug.LogWarning($"[URL Resolve] HEAD failed ({head.error}), using original URL.");
+            }
+
+            Debug.Log($"[URL Resolve] Original : {originalUrl}");
+            Debug.Log($"[URL Resolve] Resolved : {finalUrl}");
+            UpdateOutput("Loading Video...");
+            videoPlayer.url = finalUrl;
+            videoPlayer.Prepare();
+        }
+    }
+#endif
+
     void OnVideoPrepareCompleted(VideoPlayer vp)
     {
-        Debug.Log("✅ Video Prepared!");
+        Debug.Log("Video Prepared.");
+
+        // Set texture reference early so RawImage doesn't stay black
         videoDisplay.texture = vp.texture;
         vp.playbackSpeed = PLAYBACK_SPEED;
 
         if (playButton) playButton.interactable = true;
 
+        // Set slider range and total-length text RIGHT NOW,
+        // before any tap — user can see the full duration immediately.
         if (seekSlider != null)
         {
-            seekSlider.minValue = 0;
+            seekSlider.minValue = 0f;
             seekSlider.maxValue = (float)vp.length;
         }
         if (totalFramesText) totalFramesText.text = FormatTime(vp.length);
@@ -357,59 +439,27 @@ public class VideoAnnotationManager : MonoBehaviour
         }
         else
         {
-            StartCoroutine(ForceRenderFrame(0f));
+            // No saved progress — show frame 0 immediately
+            ShowFrameAt(0f);
         }
     }
 
-    // FIX 3 — MEMORY WALL: video reached end cleanly
     void OnVideoReachedEnd(VideoPlayer vp)
     {
-        Debug.Log("[Video] Reached end.");
         vp.Pause();
-        vp.time = 0;
-        _intendedPlaying = false;
-        _state = VideoState.WaitingFirstTap;
-        if (seekSlider) seekSlider.value = 0;
-        UpdateOutput("Video ended. Tap video to restart.");
+        vp.time = 0f;
+        SetPlayPauseUI(isPlaying: false);
+        if (seekSlider) seekSlider.value = 0f;
+        UpdateOutput("Video ended. Tap to restart.");
     }
 
-    // FIX 3 — MEMORY WALL: Chrome killed the video (memory overload / error)
     void OnVideoError(VideoPlayer vp, string message)
     {
-        Debug.LogError($"[VideoPlayer] Chrome error: {message}");
-        _intendedPlaying = false;
+        Debug.LogError($"[VideoPlayer] Error: {message}");
         isProcessing = false;
         isLoadingState = false;
-        _state = VideoState.WaitingFirstTap;
+        SetPlayPauseUI(isPlaying: false);
         UpdateOutput("Video error — please reload the page.");
-    }
-
-    // In WebGL, Play() called from a coroutine (not a user gesture) is
-    // blocked by Chrome's autoplay policy. We only seek — no Play+Pause.
-    IEnumerator ForceRenderFrame(float time)
-    {
-#if UNITY_WEBGL && !UNITY_EDITOR
-        videoPlayer.time = time;
-        yield return null;
-        yield return null;
-        if (seekSlider) seekSlider.value = time;
-        _intendedPlaying = false;
-        _state           = VideoState.WaitingFirstTap;
-        isLoadingState   = false;
-        UpdateOutput("Ready — tap the video to play.");
-#else
-        videoPlayer.playbackSpeed = PLAYBACK_SPEED;
-        videoPlayer.time = time;
-        videoPlayer.Play();
-        yield return null;
-        yield return null;
-        videoPlayer.Pause();
-        if (seekSlider) seekSlider.value = time;
-        _intendedPlaying = false;
-        _state = VideoState.WaitingFirstTap;
-        isLoadingState = false;
-        UpdateOutput("Ready...");
-#endif
     }
 
     // ==================================================================
@@ -417,7 +467,7 @@ public class VideoAnnotationManager : MonoBehaviour
     // ==================================================================
     void OnReEditItem(StagedAnnotation itemToEdit)
     {
-        if (_intendedPlaying) OnPauseClicked();
+        if (videoPlayer.isPlaying) OnPauseClicked();
         currentWorkingItem = itemToEdit;
         if (currentBoundingBox) Destroy(currentBoundingBox.gameObject);
         DestroyFloatingPanel();
@@ -427,21 +477,29 @@ public class VideoAnnotationManager : MonoBehaviour
     IEnumerator JumpToAnnotationRoutine(StagedAnnotation item)
     {
         UpdateOutput("Seeking...");
-        videoPlayer.time = item.timestamp;
 
-#if !UNITY_WEBGL || UNITY_EDITOR
+#if UNITY_WEBGL && !UNITY_EDITOR
+        // WebGL: seek only, use frameReady to confirm frame is visible
+        ShowFrameAt(item.timestamp);
+        // Wait until OnFrameReady clears the flag
+        float timeout = 3f;
+        while (_waitingForFrame && timeout > 0f)
+        {
+            timeout -= Time.unscaledDeltaTime;
+            yield return null;
+        }
+#else
         videoPlayer.playbackSpeed = PLAYBACK_SPEED;
+        videoPlayer.time = item.timestamp;
         videoPlayer.Play();
         yield return null;
         yield return null;
         videoPlayer.Pause();
-#else
-        yield return null;
-        yield return null;
+        if (seekSlider) seekSlider.value = item.timestamp;
+        if (currentFrameText) currentFrameText.text = FormatTime(item.timestamp);
 #endif
 
-        _intendedPlaying = false;
-        if (seekSlider) seekSlider.value = item.timestamp;
+        SetPlayPauseUI(isPlaying: false);
 
         Vector2 boxPos = new Vector2(
             (item.boundingBox.normalizedX - 0.5f) * videoDisplayRect.rect.width,
@@ -508,8 +566,7 @@ public class VideoAnnotationManager : MonoBehaviour
                 if (string.IsNullOrEmpty(json) || json == "[]" || json.StartsWith("["))
                 {
                     UpdateOutput("New Task (Ready)");
-                    StartCoroutine(ForceRenderFrame(0f));
-                    isLoadingState = false;
+                    ShowFrameAt(0f);
                     yield break;
                 }
 
@@ -542,42 +599,47 @@ public class VideoAnnotationManager : MonoBehaviour
                                 catch (Exception e) { Debug.LogError($"[API] JSON Error: {e.Message}"); }
                             }
 
-                            float resumeTime = data.last_edited_frame > 0 ? data.last_edited_frame : 0f;
-                            StartCoroutine(ForceRenderFrame(resumeTime));
-                            UpdateOutput("[Resumed]");
+                            float resumeTime = data.last_edited_frame > 0f ? data.last_edited_frame : 0f;
+
+                            // ShowFrameAt updates slider + frame text inside OnFrameReady
+                            // so the user sees the correct position immediately — no tap needed.
+                            ShowFrameAt(resumeTime);
                         }
                     }
                     else
                     {
                         UpdateOutput("New Task (Ready)");
-                        StartCoroutine(ForceRenderFrame(0f));
+                        ShowFrameAt(0f);
                     }
                 }
                 catch (Exception e)
                 {
                     Debug.LogError($"[API] Parse Error: {e.Message}");
-                    UpdateOutput("Ready (New Session)");
-                    StartCoroutine(ForceRenderFrame(0f));
+                    ShowFrameAt(0f);
                 }
             }
             else
             {
                 Debug.LogError($"[API] Request Failed: {w.error}");
                 UpdateOutput("API Error");
-                StartCoroutine(ForceRenderFrame(0f));
+                ShowFrameAt(0f);
             }
         }
-        isLoadingState = false;
+        // Note: isLoadingState is cleared inside OnFrameReady
     }
 
     IEnumerator SaveProgressAPI()
     {
         UpdateOutput("Saving...");
-        SaveRequestPayload payload = new SaveRequestPayload();
-        payload.task_id = currentTaskId;
-        payload.current_time = (float)videoPlayer.time;
-        payload.total_frame = (float)videoPlayer.length;
-        payload.percentage = (payload.total_frame > 0) ? Mathf.Clamp(Mathf.RoundToInt((payload.current_time / payload.total_frame) * 100), 0, 100) : 0;
+        SaveRequestPayload payload = new SaveRequestPayload
+        {
+            task_id = currentTaskId,
+            current_time = (float)videoPlayer.time,
+            total_frame = (float)videoPlayer.length
+        };
+        payload.percentage = (payload.total_frame > 0)
+            ? Mathf.Clamp(Mathf.RoundToInt((payload.current_time / payload.total_frame) * 100), 0, 100)
+            : 0;
 
         AnnotationListWrapper wrapper = new AnnotationListWrapper { Items = stagedList };
         payload.annotations_json = JsonUtility.ToJson(wrapper);
@@ -591,8 +653,16 @@ public class VideoAnnotationManager : MonoBehaviour
             w.SetRequestHeader("Content-Type", "application/json");
             yield return w.SendWebRequest();
 
-            if (w.result == UnityWebRequest.Result.Success) { UpdateOutput("Saved!"); stagedList.Clear(); RefreshFinalPanel(); }
-            else { UpdateOutput("❌ Save Failed"); }
+            if (w.result == UnityWebRequest.Result.Success)
+            {
+                UpdateOutput("Saved!");
+                stagedList.Clear();
+                RefreshFinalPanel();
+            }
+            else
+            {
+                UpdateOutput("Save Failed.");
+            }
         }
     }
 
@@ -611,99 +681,54 @@ public class VideoAnnotationManager : MonoBehaviour
     }
 
     // ==================================================================
-    // INTERACTION — VIDEO TAP
-    // Only fires from PointerDown on the videoDisplay RawImage.
+    // INTERACTION LOGIC
     // ==================================================================
     public void OnVideoTapped(PointerEventData data)
     {
-        if (!videoPlayer.isPrepared) return;
-        if (currentFloatingPanelObj != null) return;
+        // Block taps while loading the frame preview or processing annotation
+        if (isProcessing || !videoPlayer.isPrepared || _waitingForFrame) return;
 
-        // -----------------------------------------------------------------
-        // FIX 5 — GIANT HITBOX (mathematical fence)
-        // Even though overlayPlayButton has no raycast, Unity's canvas input
-        // can still route clicks from outside the video rect to us via
-        // bubbling. We explicitly check that the click landed inside the
-        // videoDisplay RectTransform bounds. If not — ignore it completely.
-        // -----------------------------------------------------------------
-        if (!RectTransformUtility.RectangleContainsScreenPoint(
-                videoDisplayRect, data.position, data.pressEventCamera))
+        if (!videoPlayer.isPlaying)
         {
-            Debug.Log("[Tap] Ignored — outside video bounds.");
+            OnPlayClicked();
             return;
         }
 
-        // FIX 4 — PHANTOM TAP: minimum gap between accepted taps
-        float now = Time.unscaledTime;
-        if (now - _lastTapTime < MIN_TAP_INTERVAL) return;
-        _lastTapTime = now;
+        // Video is playing — this tap is an annotation tap
+        if (currentFloatingPanelObj != null) return;
 
-        Debug.Log($"[Tap] Accepted. State={_state}");
+        RectTransformUtility.ScreenPointToLocalPointInRectangle(
+            videoDisplayRect, data.position, data.pressEventCamera, out Vector2 localPoint);
 
-        // FIX 4 — PHANTOM TAP: state machine — one action per state
-        switch (_state)
-        {
-            // -----------------------------------------------------------
-            // First tap: ONLY start the video — never annotate
-            // -----------------------------------------------------------
-            case VideoState.WaitingFirstTap:
-                _state = VideoState.Playing;
-                OnPlayClicked();
-                break;
+        wasPlayingBeforePause = true;
+        OnPauseClicked();
 
-            // -----------------------------------------------------------
-            // Playing: annotation tap — pause + capture + send screenshot
-            // -----------------------------------------------------------
-            case VideoState.Playing:
-                RectTransformUtility.ScreenPointToLocalPointInRectangle(
-                    videoDisplayRect, data.position, data.pressEventCamera, out Vector2 localPoint);
-                _state = VideoState.Annotating;
-                wasPlayingBeforePause = true;
-                OnPauseClicked();
-                isProcessing = true;
-                UpdateOutput("Annotations Generating...");
-                SpawnBoundingBox(localPoint);
-                FrameData frameData = CaptureFrameData(localPoint);
-                StartCoroutine(ProcessApiRequest(frameData, localPoint));
-                break;
-
-            // -----------------------------------------------------------
-            // Annotating: server request in flight — block all taps
-            // -----------------------------------------------------------
-            case VideoState.Annotating:
-                Debug.Log("[Tap] Blocked — annotation in progress.");
-                break;
-
-            // -----------------------------------------------------------
-            // Paused: resume playback
-            // -----------------------------------------------------------
-            case VideoState.Paused:
-                _state = VideoState.Playing;
-                OnPlayClicked();
-                break;
-        }
+        isProcessing = true;
+        UpdateOutput("Annotations Generating...");
+        SpawnBoundingBox(localPoint);
+        FrameData frameData = CaptureFrameData(localPoint);
+        StartCoroutine(ProcessApiRequest(frameData, localPoint));
     }
 
-    // -----------------------------------------------------------------
-    // FIX 1 + 2: OnPlayClicked
-    // _intendedPlaying flips instantly (FIX 2 — no waiting for Chrome).
-    // ApplySpeedAfterDelay runs 5 frames later (FIX 1 — after Chrome reset).
-    // -----------------------------------------------------------------
     public void OnPlayClicked()
     {
-        _intendedPlaying = true;
-        if (_state != VideoState.Annotating)
-            _state = VideoState.Playing;
         videoPlayer.Play();
-        StartCoroutine(ApplySpeedAfterDelay()); // FIX 1
+        ApplySpeed(); // Speed flash fix — must be right after Play()
+        SetPlayPauseUI(isPlaying: true);
     }
 
     public void OnPauseClicked()
     {
-        _intendedPlaying = false;
-        if (_state == VideoState.Playing)
-            _state = VideoState.Paused;
         videoPlayer.Pause();
+        SetPlayPauseUI(isPlaying: false);
+    }
+
+    // Central place for all play/pause button state so nothing gets out of sync
+    private void SetPlayPauseUI(bool isPlaying)
+    {
+        if (playButton) playButton.gameObject.SetActive(!isPlaying);
+        if (pauseButton) pauseButton.gameObject.SetActive(isPlaying);
+        if (overlayPlayButton) overlayPlayButton.gameObject.SetActive(!isPlaying && !isProcessing);
     }
 
     // ==================================================================
@@ -751,7 +776,9 @@ public class VideoAnnotationManager : MonoBehaviour
         Transform container = currentPanelController ? currentPanelController.contentContainer : currentFloatingPanelObj.transform;
         foreach (Transform child in container)
         {
-            if (child.GetComponent<AnnotationItemUI>() == activeHeadingUI || child.gameObject == selectedUI.gameObject || child.gameObject == activeStageButton) continue;
+            if (child.GetComponent<AnnotationItemUI>() == activeHeadingUI ||
+                child.gameObject == selectedUI.gameObject ||
+                child.gameObject == activeStageButton) continue;
             child.gameObject.SetActive(false);
         }
         activeHeadingUI.SetEditMode();
@@ -843,10 +870,9 @@ public class VideoAnnotationManager : MonoBehaviour
     }
 
     // ==================================================================
-    // PROCESS API REQUEST
-    // Captures the video frame via RenderTexture blit (WebGL-safe).
-    // Screen.ReadPixels reads the main framebuffer which in WebGL does
-    // NOT contain the video frame — video lives on its own GL texture.
+    // API REQUEST — RenderTexture blit (WebGL-safe frame capture)
+    // Screen.ReadPixels cannot read the video GL texture in WebGL.
+    // Blitting to a RenderTexture first makes it readable everywhere.
     // ==================================================================
     IEnumerator ProcessApiRequest(FrameData frameData, Vector2 localPos)
     {
@@ -857,7 +883,6 @@ public class VideoAnnotationManager : MonoBehaviour
 
         if (videoTex != null)
         {
-            // Blit video texture → our own RenderTexture → read pixels safely
             RenderTexture rt = RenderTexture.GetTemporary(videoTex.width, videoTex.height, 0, RenderTextureFormat.ARGB32);
             Graphics.Blit(videoTex, rt);
             RenderTexture prevActive = RenderTexture.active;
@@ -872,7 +897,7 @@ public class VideoAnnotationManager : MonoBehaviour
         }
         else
         {
-            // Fallback: screen capture (Editor only)
+            // Editor fallback
             Texture2D screenshot = new Texture2D(Screen.width, Screen.height, TextureFormat.RGB24, false);
             screenshot.ReadPixels(new Rect(0, 0, Screen.width, Screen.height), 0, 0);
             screenshot.Apply();
@@ -887,20 +912,21 @@ public class VideoAnnotationManager : MonoBehaviour
         f.AddField("class", currentClass ?? "");
         f.AddField("subject", currentSubject ?? "");
 
+        // C# does not allow yield inside catch blocks.
+        // We use a flag + message and yield AFTER the using block exits.
+        bool failed = false;
+        string failMessage = "";
+
         using (UnityWebRequest w = UnityWebRequest.Post("https://server.botclub.in/generate_annotations", f))
         {
+            w.timeout = requestTimeout;
             var asyncOp = w.SendWebRequest();
             float timer = 0f;
 
             while (!asyncOp.isDone)
             {
                 timer += Time.unscaledDeltaTime;
-                if (timer > autoResumeTimeout)
-                {
-                    w.Abort();
-                    Debug.LogWarning("[API] Timed out.");
-                    break;
-                }
+                if (timer > autoResumeTimeout) { w.Abort(); Debug.LogWarning("[API] Timed out."); break; }
                 yield return null;
             }
 
@@ -917,32 +943,26 @@ public class VideoAnnotationManager : MonoBehaviour
                 catch (Exception e)
                 {
                     Debug.LogError($"[API] Parse error: {e.Message}");
-                    ResumeAfterFailure("Parse error. Resuming...");
+                    failed = true;
+                    failMessage = "Parse error. Resuming...";
                 }
             }
             else
             {
                 Debug.LogWarning($"[API] Failed: {w.error}");
-                ResumeAfterFailure("Timeout. Resuming...");
+                failed = true;
+                failMessage = "Timeout. Resuming...";
             }
         }
-    }
 
-    private void ResumeAfterFailure(string message)
-    {
-        if (currentBoundingBox) Destroy(currentBoundingBox.gameObject);
-        currentBoundingBox = null;
-        isProcessing = false;
-        _state = VideoState.Paused;
-        UpdateOutput(message);
-        StartCoroutine(DelayedResume());
-    }
-
-    private IEnumerator DelayedResume()
-    {
-        yield return new WaitForSecondsRealtime(1f);
-        OnPlayClicked();
-        UpdateOutput("Ready...");
+        // Yield and resume AFTER the using block — no catch-clause restriction here
+        if (failed)
+        {
+            UpdateOutput(failMessage);
+            yield return new WaitForSecondsRealtime(1f);
+            isProcessing = false;
+            CloseFloatingPanel(true);
+        }
     }
 
     // ==================================================================
@@ -953,8 +973,8 @@ public class VideoAnnotationManager : MonoBehaviour
 #if UNITY_EDITOR
         using (MySqlConnection connection = new MySqlConnection(GetConnectionString()))
         {
-            try { connection.Open(); Debug.Log("✅ Test Connection Successful!"); }
-            catch (Exception ex) { Debug.LogError($"Database Connection Failed: {ex.Message}"); }
+            try { connection.Open(); Debug.Log("DB Connection OK."); }
+            catch (Exception ex) { Debug.LogError($"DB Connection Failed: {ex.Message}"); }
         }
 #endif
     }
